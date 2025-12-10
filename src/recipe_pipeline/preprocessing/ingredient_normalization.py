@@ -15,9 +15,44 @@ from ingrnorm.sbert_dedupe import sbert_dedupe
 from ingrnorm.w2v_dedupe import w2v_dedupe
 from ingrnorm.dedupe_map import apply_map_to_parquet_streaming, write_jsonl_map
 from ingrnorm.encoder import IngredientEncoder
+from ingrnorm.spacy_normalizer import SpacyIngredientNormalizer
+import pyarrow as pa
 
 from ..core import PipelineContext, StageResult
 from ..utils import stage_logger
+
+
+def _ensure_vocab_column(parquet_path: Path, source_col: str, target_col: str) -> Path:
+    """
+    Ensure `target_col` exists by copying `source_col` if missing.
+    Writes back to the same path (via temp) only when needed.
+    """
+    if source_col == target_col:
+        return parquet_path
+    pf = pq.ParquetFile(str(parquet_path))
+    if target_col in pf.schema_arrow.names:
+        return parquet_path
+
+    tmp = parquet_path.with_suffix(".tmp.parquet")
+    writer = None
+    for rg in range(pf.num_row_groups):
+        tbl = pf.read_row_group(rg)
+        if source_col not in tbl.column_names:
+            continue
+        cols = tbl.column_names
+        arrays = [tbl[col] for col in cols]
+        arrays.append(tbl[source_col])
+        names = list(cols) + [target_col]
+        out_tbl = pa.Table.from_arrays(arrays, names=names).replace_schema_metadata(None)
+        if writer is None:
+            writer = pq.ParquetWriter(str(tmp), out_tbl.schema, compression="zstd")
+        writer.write_table(out_tbl)
+    if writer is not None:
+        writer.close()
+        tmp.replace(parquet_path)
+    elif tmp.exists():
+        tmp.unlink()
+    return parquet_path
 
 def _cleanup_paths(cfg: dict, logger: logging.Logger, preserve_files: list[str] = None):
     """
@@ -129,6 +164,48 @@ def _validate_config(cfg: dict, logger: logging.Logger) -> None:
     
     logger.debug("Config validation passed")
 
+
+def _build_spacy_map_from_parquet(
+    parquet_path: Path,
+    list_col: str,
+    spacy_model: str,
+    batch_size: int,
+    n_process: int,
+    logger: logging.Logger,
+) -> dict:
+    """
+    Normalize all unique phrases once via spaCy and return a mapping raw -> normalized.
+    """
+    vocab = vocab_from_parquet_listcol(str(parquet_path), col=list_col, min_freq=1)
+    phrases = list(vocab.keys())
+    logger.info("[stage1] unique phrases collected: %s", len(phrases))
+    if not phrases:
+        return {}
+
+    normalizer = SpacyIngredientNormalizer(spacy_model, batch_size=batch_size, n_process=n_process)
+    mapping: dict[str, str] = {}
+
+    batch: list[list[str]] = []
+    originals: list[str] = []
+    for p in phrases:
+        batch.append([p])
+        originals.append(p)
+        if len(batch) >= batch_size:
+            norms = normalizer.normalize_batch(batch)
+            for raw, norm_list in zip(originals, norms):
+                if norm_list:
+                    mapping[raw] = norm_list[0]
+            batch.clear()
+            originals.clear()
+    if batch:
+        norms = normalizer.normalize_batch(batch)
+        for raw, norm_list in zip(originals, norms):
+            if norm_list:
+                mapping[raw] = norm_list[0]
+
+    logger.info("[stage1] spaCy map built: %s entries", len(mapping))
+    return mapping
+
 def _run_stage1_spacy_normalization(
     input_path: Path,
     ner_col: str,
@@ -150,20 +227,32 @@ def _run_stage1_spacy_normalization(
         logger.info(f"[stage1] materialize_parquet_source done → {src_parquet}")
 
         baseline_parquet.parent.mkdir(parents=True, exist_ok=True)
-        logger.info("[stage1] apply_spacy_normalizer_to_parquet starting…")
-        # Use configurable batch size and n_process for better performance
+        # Build global spaCy normalization map from all unique phrases, then apply to parquet
         spacy_batch_size = int(sbert_cfg.get("spacy_batch_size", 512))
         spacy_n_process = int(sbert_cfg.get("spacy_n_process", 0))  # 0=auto, 1=single-threaded
-        apply_spacy_normalizer_to_parquet(
-            in_parquet=str(src_parquet),
-            out_parquet=str(baseline_parquet),
+        spacy_model = sbert_cfg.get("spacy_model", "en_core_web_sm")
+
+        mapping = _build_spacy_map_from_parquet(
+            parquet_path=src_parquet,
             list_col=ner_col,
-            out_col=list_col_for_vocab,
-            spacy_model=sbert_cfg.get("spacy_model", "en_core_web_sm"),
+            spacy_model=spacy_model,
             batch_size=spacy_batch_size,
             n_process=spacy_n_process,
+            logger=logger,
         )
-        logger.info("[stage1] apply_spacy_normalizer_to_parquet done")
+
+        logger.info("[stage1] applying global map to parquet…")
+        apply_map_to_parquet_streaming(
+            in_path=str(src_parquet),
+            out_path=str(baseline_parquet),
+            mapping=mapping,
+            list_col=ner_col,
+            collapse_duplicate_words=True,
+            dedupe_tokens=True,
+        )
+        # Ensure the vocab column exists (copy from ner_col if different)
+        _ensure_vocab_column(baseline_parquet, source_col=ner_col, target_col=list_col_for_vocab)
+        logger.info("[stage1] global map application done")
 
         if src_parquet == tmp_raw_parquet and tmp_raw_parquet.exists():
             try:

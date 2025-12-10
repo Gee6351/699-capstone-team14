@@ -1,6 +1,9 @@
 *.env
-**/data/*
-venv
+**/data/raw/*
+**/data/cuisine_normalized/
+**/data/ingr_encoded/
+**/data/cuisine_encoded/
+**/data/ingr_normalized/
 *.log
 *.log.*
 __pycache__/
@@ -8,4 +11,5 @@ __pycache__/
 *.csv
 *.sqlite3
 .DS_Store
+venv
 lib/
